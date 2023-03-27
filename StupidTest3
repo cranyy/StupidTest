@@ -1,0 +1,85 @@
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import datetime as dt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
+import multiprocessing as mp
+import platform
+import logging
+from tqdm import tqdm
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+import ta
+from sklearn.linear_model import LinearRegression
+from tensorflow.keras.models import load_model
+import joblib
+
+# Import libraries from project2.py
+from project2 import get_prediction, load_model_data, preprocess_data
+
+def predict_actions(symbol, start_date, end_date):
+    stock_data = get_stock_data(symbol, start_date, end_date)
+    stock_data = preprocess_data(stock_data)
+
+    # Load models from project2.py
+    models = load_model_data()
+
+    # Predict actions using the models
+    actions = get_prediction(models, stock_data)
+
+    return actions
+
+
+# Main loop
+if __name__ == '__main__':
+    if platform.system() == 'Windows':
+        mp.set_start_method('spawn')
+    mp.freeze_support()
+
+    # Define logger
+    logger = mp.log_to_stderr(logging.INFO)
+
+    # Define global variable for S&P 500 list
+    sp500_list = []
+
+    # 1. Data Collection
+    # Get the list of S&P 500 stocks
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    table = pd.read_html(url)
+    sp500_list = table[0]['Symbol'].tolist()
+
+    # Define date range for historical data
+    start_date = dt.datetime(2010, 1, 1)
+    end_date = dt.datetime.now()
+
+    # Initialize an empty DataFrame to store results
+    actions_df = pd.DataFrame(columns=['Symbol', '1d_Action', '7d_Action', '1month_Action'])
+
+    # Iterate through S&P 500 stocks and predict their actions
+    for symbol in tqdm(sp500_list):
+        tqdm.write(f"Processing {symbol}...")
+
+        try:
+            # Predict actions
+            actions = predict_actions(symbol, start_date, end_date)
+
+            new_row = pd.DataFrame({'Symbol': [symbol],
+                        '1d_Action': [actions[0]],
+                        '7d_Action': [actions[1]],
+                        '1month_Action': [actions[2]]})
+            actions_df = pd.concat([actions_df, new_row], ignore_index=True)
+
+            tqdm.write(f"{symbol} Actions: 1d - {actions[0]}, 7d - {actions[1]}, 1month - {actions[2]}")
+
+        except Exception as e:
+                    tqdm.write(f"Error processing {symbol}: {e}")
+
+    tqdm.write("")  # Add empty line for readability
+
+# Save the results in a DataFrame
+actions_df.to_csv("actions_results.csv", index=False)
+
+print("Actions predicted successfully!")
