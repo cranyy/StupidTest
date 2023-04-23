@@ -102,7 +102,11 @@ def gru_model(stock_data, retrain=False):
 
         X = stock_data[selected_features]
         y = stock_data['Close']
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+    
+        if len(y_test) < 2:
+            print(f"Error: Not enough data in the test set for {symbol}.")
+        return None, None, None, None, None, None
 
         scaler = MinMaxScaler()
         X_train = scaler.fit_transform(X_train)
