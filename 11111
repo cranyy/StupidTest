@@ -1,0 +1,705 @@
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import datetime as dt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
+import multiprocessing as mp
+import platform
+import logging
+from tqdm import tqdm
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+import ta
+from sklearn.linear_model import LinearRegression
+from tensorflow.keras.models import load_model
+import joblib
+from alpha_vantage.timeseries import TimeSeries
+from alpha_vantage.fundamentaldata import FundamentalData
+import os
+from sklearn.metrics import mean_squared_error, r2_score
+import random
+import json
+import matplotlib.pyplot as plt
+import plotly.offline as pyo
+import plotly.graph_objs as go
+import plotly.io as pio
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.feature_selection import RFE, SelectKBest, f_regression
+from sklearn.linear_model import Lasso
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import GridSearchCV, ParameterGrid
+from ta.trend import PSARIndicator, AroonIndicator, DPOIndicator
+from ta.momentum import PercentagePriceOscillator
+from ta.volume import MFIIndicator
+
+
+# Read config file
+with open('config.json', 'r') as f:
+    config = json.load(f)
+
+# Use parameters from config in your functions
+start_date = dt.datetime.strptime(config["start_date"], "%Y-%m-%d")
+end_date = dt.datetime.strptime(config["end_date"], "%Y-%m-%d")
+num_symbols = config["num_symbols"]
+
+# For Linear Regression
+lr_model_file = config["linear_regression"]["model_file"]
+
+api_key = "XG8IFQJ9QVLQ5HE7"
+def feature_selection(stock_data, method="SelectKBest", n_features=7):
+    X = stock_data.drop("Close", axis=1)
+    y = stock_data["Close"]
+
+    if method == "RFE":
+        estimator = LinearRegression()
+        selector = RFE(estimator, n_features_to_select=n_features, step=1)
+        selector = selector.fit(X, y)
+        selected_columns = X.columns[selector.support_]
+
+    elif method == "SelectKBest":
+        selector = SelectKBest(score_func=f_regression, k=n_features)
+        selector.fit(X, y)
+        selected_columns = X.columns[selector.get_support()]
+
+
+
+    return selected_columns
+
+def get_company_overview(symbol, api_key):
+    fd = FundamentalData(key=api_key)
+    data, _ = fd.get_company_overview(symbol=symbol)
+    return data
+
+def get_alpha_vantage_time_series_data(symbol, api_key):
+    ts = TimeSeries(key=api_key, output_format='pandas')
+    data, _ = ts.get_daily_adjusted(symbol=symbol, outputsize='full')
+    data = data.rename(columns={'4. close': 'Close_av'})
+    return data
+
+from tensorflow.keras.layers import GRU
+
+def gru_model(stock_data, retrain=False):
+    model_file = 'gru_model.h5'
+    X_test, y_test, y_pred = None, None, None  # Initialize variables here
+    if os.path.isfile(model_file) and not retrain:
+        model = load_model(model_file)
+        print(f"Loaded GRU model from {model_file}")
+
+        # Create dummy data when loading the model and not retraining
+        X_test, y_test = np.empty((1, 1, 10)), np.empty((1,))
+        y_pred = np.empty((1,))
+
+    else:
+        stock_data = stock_data.dropna()
+        selected_features = feature_selection(stock_data, method="SelectKBest", n_features=10)
+        
+        if not selected_features:
+            print("Error: Not enough data to train the model.")
+            return None, None, None, None, None, None
+
+        X = stock_data[selected_features]
+        y = stock_data['Close']
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        scaler = MinMaxScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_test = scaler.transform(X_test)
+
+        X_train = X_train.reshape((X_train.shape[0], 1, X_train.shape[1]))
+        X_test = X_test.reshape((X_test.shape[0], 1, X_test.shape[1]))
+
+        model = Sequential()
+        model.add(GRU(50, activation='relu', input_shape=(X_train.shape[1], X_train.shape[2])))
+        model.add(Dense(1))
+        model.compile(optimizer='adam', loss='mse')
+
+        model.fit(X_train, y_train, epochs=50, batch_size=32, verbose=2, shuffle=False)
+
+        model.save(model_file)
+
+    y_pred = model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+
+    last_30_days = stock_data[X.columns].tail(30)
+    last_30_days_scaled = scaler.transform(last_30_days)
+    last_30_days_scaled = last_30_days_scaled.reshape((last_30_days_scaled.shape[0], 1, last_30_days_scaled.shape[1]))
+    future_prices = model.predict(last_30_days_scaled)
+
+    return mse, r2, future_prices, y_test, y_pred, X_test
+
+def data_has_changed(stock_data_old, stock_data_new):
+    return not stock_data_old.equals(stock_data_new)
+
+from sklearn.model_selection import KFold
+from tqdm.auto import tqdm
+from sklearn.model_selection import cross_val_score
+from joblib import Parallel, delayed
+
+def score_hyperparams(model, X, y, params, cv_splits):
+    model.set_params(**params)
+    scores = cross_val_score(model, X, y, scoring='neg_mean_squared_error', cv=cv_splits)
+    return params, scores.mean()
+
+class TqdmSplits(KFold):
+    def __init__(self, n_splits=5, *args, **kwargs):
+        super().__init__(n_splits, *args, **kwargs)
+
+    def split(self, X, y=None, groups=None):
+        iterator = super().split(X, y, groups)
+        return tqdm(iterator, total=self.n_splits)
+
+def custom_cv_splits(n_splits=3):
+    return TqdmSplits(n_splits=n_splits)
+
+def random_forest_model(stock_data, retrain=False):
+    model_file = 'random_forest_model.pkl'
+    
+    if os.path.isfile(model_file) and not retrain:
+        model = joblib.load(model_file)
+        print(f"Loaded random forest model from {model_file}")
+    
+    stock_data = stock_data.dropna()
+    selected_features = feature_selection(stock_data, method="SelectKBest", n_features=7)
+    X = stock_data[selected_features]
+    y = stock_data['Close']
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    scaler = MinMaxScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+
+    model = RandomForestRegressor(random_state=42)
+    rf_params = {'n_estimators': [50, 100, 200],
+                 'max_depth': [None, 5, 10, 20]}
+    grid_search = GridSearchCV(estimator=model, param_grid=rf_params, scoring='neg_mean_squared_error', cv=custom_cv_splits(5), n_jobs=-1, verbose=2)
+    grid_search.fit(X_train, y_train)
+    best_model = grid_search.best_estimator_
+    print(f"{symbol}: GridSearchCV completed for random forest model")
+    best_model = grid_search.best_estimator_
+
+    y_pred = best_model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+
+    last_30_days = stock_data[X.columns].tail(30)
+    last_30_days_scaled = scaler.transform(last_30_days)
+    future_prices = best_model.predict(last_30_days_scaled)
+
+    joblib.dump(best_model, model_file)
+
+    return mse, r2, future_prices, y_test, y_pred
+
+
+def linear_regression_model(stock_data, retrain=False):
+    model_file = 'linear_regression_model.pkl'
+    if os.path.isfile(model_file) and not retrain:
+        model = joblib.load(model_file)
+        print(f"Loaded linear regression model from {model_file}")
+    stock_data = stock_data.dropna()
+    selected_features = feature_selection(stock_data, method="SelectKBest", n_features=10)
+    X = stock_data[selected_features]
+    y = stock_data['Close']
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Scale the features
+    scaler = MinMaxScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+    
+    model = Lasso(max_iter=10000)  # Increase the number of iterations
+    lasso_params = {'model__alpha': [0.001, 0.01, 0.1, 1, 10]}
+    pipeline = Pipeline([('model', model)])
+    grid_search = GridSearchCV(estimator=pipeline, param_grid=lasso_params, scoring='neg_mean_squared_error', cv=custom_cv_splits(5))
+    grid_search.fit(X_train, y_train)
+    best_model = grid_search.best_estimator_
+    y_pred = best_model.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    last_30_days = stock_data[X.columns].tail(30)
+    last_30_days_scaled = scaler.transform(last_30_days)
+    future_prices = best_model.predict(last_30_days_scaled)
+    joblib.dump(best_model, model_file)
+    return mse, r2, future_prices, y_test, y_pred,
+
+def add_RSI(stock_data, period=14):
+    rsi = ta.momentum.RSIIndicator(close=stock_data["Close"], window=period)
+    stock_data["RSI"] = rsi.rsi()
+
+def add_MACD(stock_data, short_period=12, long_period=26, signal_period=9):
+    macd = ta.trend.MACD(close=stock_data["Close"], window_slow=long_period, window_fast=short_period, window_sign=signal_period)
+    stock_data["MACD"] = macd.macd()
+    stock_data["MACD_Signal"] = macd.macd_signal()
+
+def add_Bollinger_Bands(stock_data, period=20, std_dev=2):
+    bollinger = ta.volatility.BollingerBands(close=stock_data["Close"], window=period, window_dev=std_dev)
+    stock_data["Bollinger_High"] = bollinger.bollinger_hband()
+    stock_data["Bollinger_Low"] = bollinger.bollinger_lband()
+
+def add_Stochastic_Oscillator(stock_data, period=14, smooth_period=3):
+    stoch = ta.momentum.StochasticOscillator(close=stock_data["Close"], high=stock_data["High"], low=stock_data["Low"], window=period, smooth_window=smooth_period)
+    stock_data["Stoch_Oscillator"] = stoch.stoch()
+
+def add_Chaikin_Money_Flow(stock_data, period=20):
+    cmf = ta.volume.ChaikinMoneyFlowIndicator(high=stock_data["High"], low=stock_data["Low"], close=stock_data["Close"], volume=stock_data["Volume"], window=period)
+    stock_data["Chaikin_MF"] = cmf.chaikin_money_flow()
+
+def add_Average_True_Range(stock_data, period=14):
+    atr = ta.volatility.AverageTrueRange(high=stock_data["High"], low=stock_data["Low"], close=stock_data["Close"], window=period)
+    stock_data["ATR"] = atr.average_true_range()
+
+def add_Commodity_Channel_Index(stock_data, period=20):
+    cci = ta.trend.CCIIndicator(high=stock_data["High"], low=stock_data["Low"], close=stock_data["Close"], window=period)
+    stock_data["CCI"] = cci.cci()
+
+def add_Rate_of_Change(stock_data, period=12):
+    roc = ta.momentum.ROCIndicator(close=stock_data["Close"], window=period)
+    stock_data["ROC"] = roc.roc()
+
+def add_Triple_Exponential_Moving_Average(stock_data, period=10):
+    ema = ta.trend.EMAIndicator(close=stock_data["Close"], window=period)
+    stock_data["TEMA"] = ema.ema_indicator()
+
+def add_WilliamsR(stock_data, period=14):
+    wr = ta.momentum.WilliamsRIndicator(high=stock_data["High"], low=stock_data["Low"], close=stock_data["Close"], lbp=period)
+    stock_data["WilliamsR"] = wr.williams_r()
+
+def add_Volume_Range(stock_data):
+    stock_data["Volume_Range"] = stock_data["High"] - stock_data["Low"]
+
+
+def add_OBV(stock_data):
+    obv = ta.volume.OnBalanceVolumeIndicator(close=stock_data["Close"], volume=stock_data["Volume"])
+    stock_data["OBV"] = obv.on_balance_volume()
+
+def add_Parabolic_SAR(stock_data, step=0.02, max_step=0.2):
+    psar = PSARIndicator(high=stock_data["High"], low=stock_data["Low"], close=stock_data["Close"], step=step, max_step=max_step)
+    stock_data["Parabolic_SAR"] = psar.psar()
+
+def add_Aroon_Oscillator(stock_data, period=25):
+    aroon = AroonIndicator(close=stock_data["Close"], window=period)
+    stock_data["Aroon_Oscillator"] = aroon.aroon_indicator()
+
+def add_Detrended_Price_Oscillator(stock_data, period=20):
+    dpo = DPOIndicator(close=stock_data["Close"], window=period)
+    stock_data["DPO"] = dpo.dpo()
+
+def add_Money_Flow_Index(stock_data, period=14):
+    mfi = MFIIndicator(high=stock_data["High"], low=stock_data["Low"], close=stock_data["Close"], volume=stock_data["Volume"], window=period)
+    stock_data["MFI"] = mfi.money_flow_index()
+
+def add_Percentage_Price_Oscillator(stock_data, slow_period=26, fast_period=12, signal_period=9):
+    ppo = PercentagePriceOscillator(close=stock_data["Close"], window_slow=slow_period, window_fast=fast_period, window_sign=signal_period)
+    stock_data["PPO"] = ppo.ppo()
+    stock_data["PPO_Signal"] = ppo.ppo_signal()
+
+# Function to download stock data
+def get_stock_data(ticker, start, end):
+    # Download daily stock data
+    daily_stock_data = yf.download(ticker, start=start, end=end)
+    daily_stock_data.index = daily_stock_data.index.tz_localize(None)
+    print(f"{ticker}: {len(daily_stock_data)} daily data points from Yahoo Finance")
+
+    # Download hourly stock data for the last 730 days
+    end_date_hourly = end
+    start_date_hourly = end - pd.DateOffset(days=730)
+    hourly_stock_data = yf.download(ticker, start=start_date_hourly, end=end_date_hourly, interval='1h')
+    hourly_stock_data.index = hourly_stock_data.index.tz_localize(None)
+    print(f"{ticker}: {len(hourly_stock_data)} hourly data points from Yahoo Finance")
+
+    # Merge daily and hourly stock data
+    stock_data = pd.concat([daily_stock_data, hourly_stock_data])
+    # Remove duplicates and sort by date
+    stock_data = stock_data.loc[~stock_data.index.duplicated(keep='last')].sort_index()
+    return stock_data
+
+
+# Function to add features to stock data
+def add_features(stock_data):
+
+    stock_data.index = stock_data.index.tz_localize(None)
+    num_technical_indicators = 0
+    # Add 7-day rolling mean
+    stock_data['7_day_mean'] = stock_data['Close'].rolling(window=7).mean()
+    num_technical_indicators += 1
+
+    # Add 30-day rolling mean
+    stock_data['30_day_mean'] = stock_data['Close'].rolling(window=30).mean()
+    num_technical_indicators += 1
+
+    # Add 365-day rolling mean
+    stock_data['365_day_mean'] = stock_data['Close'].rolling(window=365).mean()
+    num_technical_indicators += 1
+    # Add new features
+    stock_data['Day_of_week'] = stock_data.index.dayofweek
+    num_technical_indicators += 1
+    stock_data['Day_of_month'] = stock_data.index.day
+    num_technical_indicators += 1
+    stock_data['Month'] = stock_data.index.month
+    num_technical_indicators += 1
+
+    # Add RSI
+    add_RSI(stock_data) 
+    num_technical_indicators += 1
+
+    # Add MACD
+    add_MACD(stock_data)
+    num_technical_indicators += 1
+    # Add Bollinger Bands
+    add_Bollinger_Bands(stock_data)
+    num_technical_indicators += 1
+    add_Stochastic_Oscillator(stock_data)
+    num_technical_indicators += 1
+    add_Chaikin_Money_Flow(stock_data)
+    num_technical_indicators += 1
+    add_Average_True_Range(stock_data)
+    num_technical_indicators += 1
+    add_Commodity_Channel_Index(stock_data)
+    num_technical_indicators += 1
+    add_Rate_of_Change(stock_data)
+    num_technical_indicators += 1
+    add_Triple_Exponential_Moving_Average(stock_data)
+    num_technical_indicators += 1
+    add_WilliamsR(stock_data)
+    num_technical_indicators += 1
+    add_Parabolic_SAR(stock_data)
+    num_technical_indicators += 1
+    add_Aroon_Oscillator(stock_data)
+    num_technical_indicators += 1
+    add_Detrended_Price_Oscillator(stock_data)
+    num_technical_indicators += 1
+    add_Money_Flow_Index(stock_data)
+    num_technical_indicators += 1
+     # Add Percentage Price Oscillator only for SPY
+    if symbol == 'SPY':
+        add_Percentage_Price_Oscillator(stock_data)
+        num_technical_indicators += 1
+        print("Added PPO for SPY")
+     # Add 1-hour and 6-hour rolling mean
+    stock_data_1h = stock_data.resample('1H').mean()
+    stock_data_6h = stock_data.resample('6H').mean()
+
+    stock_data['1_hour_mean'] = stock_data_1h['Close'].rolling(window=1).mean()
+    stock_data['6_hour_mean'] = stock_data_6h['Close'].rolling(window=1).mean()
+
+    stock_data['1_hour_mean'] = stock_data['1_hour_mean'].interpolate(method='time')
+    stock_data['6_hour_mean'] = stock_data['6_hour_mean'].interpolate(method='time')
+    num_technical_indicators += 2  # Increment the count for the new features
+
+    # Add Volume Range and OBV features
+    add_Volume_Range(stock_data)
+    num_technical_indicators += 1
+
+    add_OBV(stock_data)
+    num_technical_indicators += 1
+
+    print(f"Added {num_technical_indicators} technical indicators to stock data")
+    return stock_data
+    
+    
+
+    
+def get_action(current_price, future_price, threshold=0.03):
+    if future_price > current_price * (1 + threshold):
+        return 'BUY'
+    elif future_price < current_price * (1 - threshold):
+        return 'SELL'
+    else:
+        return 'UNKNOWN'
+
+import time
+
+import plotly.graph_objs as go
+import plotly.io as pio
+
+def save_plot(stock_data, y_test, y_pred, rf_y_pred, symbol, model_type, tomorrow_price, future_prices_7d, future_prices_1m, gru_X_test, gru_y_pred):
+    # Create a Scatter trace for actual prices
+    if not os.path.exists("Figures"):
+        os.makedirs("Figures")
+    actual_prices_trace = go.Scatter(
+        x=stock_data.index,
+        y=stock_data["Close"],
+        mode='lines',
+        name='Actual prices'
+    )
+
+    # Create a Scatter trace for predicted prices
+    predicted_prices_trace = go.Scatter(
+        x=y_test.index,
+        y=y_pred,
+        mode='markers',
+        name='Predicted prices'
+    )
+
+    # Create a Scatter trace for tomorrow predicted price
+    tomorrow_predicted_trace = go.Scatter(
+        x=[stock_data.index[-1] + pd.DateOffset(days=1)],
+        y=[tomorrow_price],
+        mode='markers',
+        name='Tomorrow predicted price',
+        text=['Tomorrow predicted price']
+    )
+
+    # Create a Scatter trace for 7d predicted price
+    future_prices_7d_trace = go.Scatter(
+        x=[stock_data.index[-1] + pd.DateOffset(days=7)],
+        y=[future_prices_7d],
+        mode='markers',
+        name='7d predicted price',
+        text=['7d predicted price']
+    )
+
+    # Create a Scatter trace for 30d predicted price
+    future_prices_1m_trace = go.Scatter(
+        x=[stock_data.index[-1] + pd.DateOffset(days=30)],
+        y=[future_prices_1m],
+        mode='markers',
+        name='30d predicted price',
+        text=['30d predicted price']
+    )
+    rf_predicted_prices_trace = go.Scatter(
+        x=y_test.index,
+        y=rf_y_pred,
+        mode='lines+markers',
+        name='Random Forest Predicted prices',
+        marker=dict(size=6),
+        line=dict(width=1)
+)
+    # Create a DataFrame for the random forest predicted prices
+    rf_predicted_prices_df = pd.DataFrame({'Date': y_test.index, 'Price': rf_y_pred})
+    rf_predicted_prices_df.set_index('Date', inplace=True)
+    rf_predicted_prices_interpolated = rf_predicted_prices_df.reindex(stock_data.index).interpolate(method='time')
+
+    # Create a Scatter trace for random forest predicted prices
+    rf_predicted_prices_trace = go.Scatter(
+        x=rf_predicted_prices_interpolated.index,
+        y=rf_predicted_prices_interpolated['Price'],
+        mode='lines+markers',
+        name='Random Forest Predicted prices'
+    
+    
+    )
+    # Create a Scatter trace for RF tomorrow predicted price
+    rf_tomorrow_predicted_trace = go.Scatter(
+        x=[stock_data.index[-1] + pd.DateOffset(days=1)],
+        y=[rf_future_prices[-2]],
+        mode='markers',
+        name='RF Tomorrow predicted price',
+        text=['RF Tomorrow predicted price']
+    )
+    
+    rf_future_prices_7d_trace = go.Scatter(
+        x=[stock_data.index[-1] + pd.DateOffset(days=7)],
+        y=[rf_future_prices],
+        mode='markers',
+        name='RF 7d predicted price',
+        text=['RF 7d predicted price']
+)
+
+    # Create a Scatter trace for RF 30d predicted price
+    rf_future_prices_1m_trace = go.Scatter(
+        x=[stock_data.index[-1] + pd.DateOffset(days=30)],
+        y=[rf_future_prices[-30]],
+        mode='markers',
+        name='RF 30d predicted price',
+        text=['RF 30d predicted price']
+    )
+    gru_predicted_prices_trace = go.Scatter(
+        x=gru_X_test.index,
+        y=gru_y_pred,
+        mode='lines+markers',
+        name='GRU Predicted prices'
+
+
+    )
+    
+    # Create a layout for the plot
+    layout = go.Layout(
+        title=f"Compare predicted prices to actual prices for {symbol} ({model_type})",
+        xaxis=dict(title='Date'),
+        yaxis=dict(title='Price')
+    )
+
+    # Create a Figure object
+  
+    fig = go.Figure(data=[actual_prices_trace, predicted_prices_trace, tomorrow_predicted_trace, future_prices_7d_trace, future_prices_1m_trace, rf_predicted_prices_trace, rf_tomorrow_predicted_trace, rf_future_prices_7d_trace, rf_future_prices_1m_trace, gru_predicted_prices_trace], layout=layout)
+
+    # Save the figure as a static image
+    pio.write_image(fig, f'Figures/{symbol}_{model_type}_fig.png')
+    pyo.plot(fig, filename=f'Figures/{symbol}_{model_type}_fig.html', auto_open=False)
+
+def generate_timestamped_filename(prefix, extension):
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    return f"{prefix}_{timestamp}.{extension}"
+
+def merge_dataframes(stock_data_yf, stock_data_av):
+    # Convert the timezone of the Yahoo Finance data to a timezone-naive index
+    stock_data_yf.index = stock_data_yf.index.tz_localize(None)
+
+    # Convert the timezone of the Alpha Vantage data to a timezone-naive index
+    stock_data_av.index = stock_data_av.index.tz_localize(None)
+
+    # Merge the two DataFrames and remove duplicates
+    merged_data = pd.concat([stock_data_yf, stock_data_av], axis=1)
+    merged_data = merged_data.loc[:, ~merged_data.columns.duplicated()]
+    return merged_data
+
+if __name__ == '__main__':
+    if platform.system() == 'Windows':
+        mp.set_start_method('spawn')
+        mp.freeze_support()
+    # Define logger
+    logger = mp.log_to_stderr(logging.INFO)
+    # Define global variable for S&P 500 list
+    sp500_list = []
+    # 1. Data Collection
+    # Get the list of S&P 500 stocks
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    table = pd.read_html(url)
+    sp500_list = table[0]['Symbol'].tolist()[:num_symbols]
+
+    # Add SPX, DOW, and Tech 100 tickers to the beginning of the list
+    sp500_list.insert(0, 'SPY') 
+    sp500_list.insert(1, 'DIA')  
+    sp500_list.insert(2, 'QQQ')  
+
+    # Define date range for historical data
+    start_date = dt.datetime(1950, 1, 1)
+    end_date = dt.datetime.now()
+
+    # Initialize an empty DataFrame to store results
+    results_df = pd.DataFrame(columns=['Symbol', 'LR_MSE','RF_MSE','LR_r2', 'RF_r2', 'Today', 'Today_Close_Price', 'Tomorrow', 'Tomorrow_Close_Price_Prediction', '1d_Action', '1d_Action_3p', '1d_Action_5p', '1d_Action_10p', 'Tomorrow'])
+
+    all_predictions_dfs = []
+    
+    # Iterate through S&P 500 stocks and predict their prices
+    for symbol in tqdm(sp500_list):
+        print(f"Processing {symbol}...")
+        predictions_df = None
+        try:
+            # Get the stock data from Yahoo Finance
+            stock_data_yf = get_stock_data(symbol, start_date, end_date)
+            print(f"{symbol}: Got stock data from Yahoo Finance")
+
+            # Get the stock data from Alpha Vantage
+            stock_data_av = get_alpha_vantage_time_series_data(symbol, api_key)
+            print(f"{symbol}: {len(stock_data_av)} data points from Alpha Vantage")
+
+            # Merge the two DataFrames and remove duplicates
+            stock_data = merge_dataframes(stock_data_yf, stock_data_av)
+            print(f"{symbol}: Merged stock data from Yahoo Finance and Alpha Vantage")
+            
+
+            # Add features
+            stock_data = add_features(stock_data)
+            print(f"{symbol}: Added features to stock data")
+
+            # Train and evaluate the GRU model
+            gru_mse, gru_r2, gru_future_prices, gru_y_test, gru_y_pred, gru_X_test = gru_model(stock_data)
+
+            if gru_mse is None:
+                print(f"Error processing {symbol}: Not enough data to train the GRU model")
+                continue
+
+            print(f"{symbol}: Trained and evaluated GRU model")
+            print(f"{symbol}: GRU MSE: {gru_mse}")
+            # Train and evaluate the random forest model
+            rf_mse, rf_r2, rf_future_prices, rf_y_test, rf_y_pred = random_forest_model(stock_data)
+            print(f"{symbol}: Trained and evaluated random forest model")
+            print(f"{symbol}: Random Forest MSE: {rf_mse}")
+            print()
+
+            # Train and evaluate the linear regression model
+            lr_mse, lr_r2, lr_future_prices, y_test, y_pred = linear_regression_model(stock_data)
+            print(f"{symbol}: Trained and evaluated linear regression model")
+            print(f"{symbol}: Linear Regression MSE: {lr_mse}")
+
+            best_model = 'LR' if lr_mse < rf_mse else 'RF'
+            print(f"{symbol}: Best model: {best_model}")
+            print()
+
+            current_price = stock_data_yf.tail(1)['Close'].iloc[0]
+            print(f"{symbol}: Current price: {current_price}")
+            print()
+
+            action_1d = get_action(current_price, lr_future_prices[-1])
+            action_3p = get_action(current_price, lr_future_prices[-1], threshold=0.03)
+            action_5p = get_action(current_price, lr_future_prices[-1], threshold=0.05)
+            action_10p = get_action(current_price, lr_future_prices[-1], threshold=0.1)
+
+            # Predict tomorrow's close price
+            tomorrow_price = lr_future_prices[-2] if dt.datetime.now().hour >= 16 else lr_future_prices[-1]
+            print(f"{symbol}: Tomorrow's price: {tomorrow_price}")
+            print()
+            
+            future_prices_7d = lr_future_prices[-7]
+            future_prices_1m = lr_future_prices[-30]
+
+            print(f"{symbol}: Added predictions to DataFrame")
+            if predictions_df is not None:
+                predictions_df.loc[0, 'RF_MSE'] = rf_mse
+                predictions_df.loc[0, 'RF_r2'] = rf_r2
+                predictions_df.loc[0, 'Tomorrow_Close_Price_Prediction_RF'] = rf_future_prices[-1]
+                predictions_df.loc[0, '7d_Close_Price_Prediction_RF'] = rf_future_prices[-7]
+                predictions_df.loc[0, '1m_Close_Price_Prediction_RF'] = rf_future_prices[-30]
+                predictions_df.loc[0, 'GRU_MSE'] = gru_mse
+                predictions_df.loc[0, 'GRU_r2'] = gru_r2
+                predictions_df.loc[0, 'Tomorrow_Close_Price_Prediction_GRU'] = gru_future_prices[-1]
+                predictions_df.loc[0, '7d_Close_Price_Prediction_GRU'] = gru_future_prices[-7]
+                predictions_df.loc[0, '1m_Close_Price_Prediction_GRU'] = gru_future_prices[-30]
+            # Get today's date and tomorrow's date
+            today_date_date = stock_data.index[-1].strftime("%Y-%m-%d")
+            tomorrow_date = (stock_data.index[-1] + pd.DateOffset(days=1)).strftime("%Y-%m-%d")
+
+            save_plot(stock_data, y_test, y_pred, rf_y_pred, symbol, 'Linear Regression and Random Forest', tomorrow_price, future_prices_7d, future_prices_1m, gru_X_test, gru_y_pred)
+           
+            print(f"{symbol}: Saved Plot")
+
+            # Create a new DataFrame for the stock's predictions
+            predictions_df = pd.DataFrame({'Symbol': [symbol],
+                                            'LR_MSE': [lr_mse],
+                                            'RF_MSE': [rf_mse],
+                                            'rf_r2': [rf_r2],
+                                            'LR_r2': [lr_r2],
+                                            'gru_mse': [gru_mse],
+                                            'gru_r2': [gru_r2],
+                                            'Today': [today_date_date],
+                                            'Today_Close_Price':[current_price],
+                                            'Tomorrow': [tomorrow_date],
+                                            'Tomorrow_Close_Price_Prediction': [lr_future_prices[-2] if best_model == 'LR' else rf_future_prices[-2]],
+                                            '7d_Close_Price_Prediction': [lr_future_prices[-7] if best_model == 'LR' else rf_future_prices[-7]],
+                                            '1m_Close_Price_Prediction': [lr_future_prices[-30] if best_model == 'LR' else rf_future_prices[-30]],
+                                            '1d_Action_3p': [action_3p],
+                                            '1d_Action_5p': [action_5p],
+                                            '1d_Action_10p': [action_10p],
+                                            'Tomorrow_Close_Price_Prediction_GRU': [gru_future_prices[-1]],
+                                            '7d_close_price_prediction_GRU': [gru_future_prices[-7]],
+                                            '1m_Close_Price_Prediction_GRU' : [gru_future_prices[-30]],
+                                            'Tomorrow_Close_Price_Prediction_RF': [rf_future_prices[-1]],
+                                            '7d_Close_Price_Prediction_RF': [rf_future_prices[-7]],
+            
+                                            '1m_Close_Price_Prediction_RF': [rf_future_prices[-30]],
+                                            
+
+                                            
+                                            '1d_Action': [action_1d]})
+
+        except Exception as e:
+            print(f"Error processing {symbol}: {e}")
+
+        finally:
+            tqdm.write("")  # Add empty line for readability
+
+            if predictions_df is not None:
+    # Append the stock's predictions DataFrame to the list of all predictions DataFrames
+                all_predictions_dfs.append(predictions_df)
+
+    # Concatenate all predictions DataFrames
+    combined_predictions_df = pd.concat(all_predictions_dfs, ignore_index=True)
+
+    # Save the combined predictions DataFrame to a CSV file with a timestamp in its name
+    csv_filename = generate_timestamped_filename("predictions", "csv")
+    combined_predictions_df.to_csv(csv_filename, index=False)
+    print(f"Saved combined predictions to {csv_filename}")
